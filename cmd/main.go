@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -15,7 +16,8 @@ import (
 	"nhooyr.io/websocket"
 )
 
-// ====== wire protocol (совпадает с Android) ======
+// ================= Wire protocol =================
+
 type Candidate struct {
 	SDPMid        *string `json:"sdpMid,omitempty"`
 	SDPMLineIndex *int    `json:"sdpMLineIndex,omitempty"`
@@ -25,13 +27,14 @@ type Candidate struct {
 type Envelope struct {
 	Type      string     `json:"type"` // join | peer-joined | offer | answer | ice | leave
 	Room      string     `json:"room,omitempty"`
-	PeerID    string     `json:"peerId,omitempty"` // в исходящих "peer-joined"
+	PeerID    string     `json:"peerId,omitempty"` // исходящие "peer-joined"
 	From      string     `json:"from,omitempty"`   // сервер подставляет id отправителя
 	SDP       string     `json:"sdp,omitempty"`
 	Candidate *Candidate `json:"candidate,omitempty"`
 }
 
-// ====== room hub ======
+// ================= Hub / Rooms =================
+
 type Client struct {
 	id   string
 	room *Room
@@ -70,7 +73,7 @@ func (r *Room) broadcast(from string, payload []byte) {
 		select {
 		case c.send <- payload:
 		default:
-			// переполнен канал — отключаем
+			// медленный потребитель — закрываем
 			go c.conn.Close(websocket.StatusPolicyViolation, "slow consumer")
 		}
 	}
@@ -107,34 +110,57 @@ func (h *Hub) maybeDelete(roomID string) {
 	}
 }
 
-// ====== websocket handler ======
+// ================= WS handler =================
+
 var hub = NewHub()
 
+const (
+	readLimitBytes = 1 << 20 // 1 MiB
+	joinTimeout    = 15 * time.Second
+	writeTimeout   = 10 * time.Second
+	pingInterval   = 30 * time.Second
+	pongTimeout    = 60 * time.Second // сколько ждём PONG на наш PING
+)
+
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-	// Позволим любые Origin (для локальной разработки). В проде — включи проверку.
+	// Разрешаем Origin:
+	// PROD: укажи точный домен; DEV: "*" (ниже переключается env-ом).
+	originPatterns := []string{"webrtc.mediarise.org"}
+	if getenv("WS_ALLOW_ANY_ORIGIN", "") != "" {
+		originPatterns = []string{"*"}
+	}
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: []string{"*"},
+		OriginPatterns: originPatterns,
 	})
 	if err != nil {
 		http.Error(w, "upgrade failed", http.StatusBadRequest)
 		return
 	}
-	defer func() {
-		_ = conn.Close(websocket.StatusNormalClosure, "")
-	}()
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "") }()
 
-	ctx := r.Context()
-	conn.SetReadLimit(1 << 20) // 1MB
+	// Установим лимит на входящие сообщения
+	conn.SetReadLimit(readLimitBytes)
 
-	// Ждём первый пакет "join"
+	// Собственный контекст соединения, чтобы можно было его отменить
+	connCtx, cancelConn := context.WithCancel(r.Context())
+	defer cancelConn()
+
+	// 1) Ждём первый пакет "join" с таймаутом
 	var join Envelope
-	if err := readJSON(ctx, conn, &join); err != nil {
-		log.Printf("join read error: %v", err)
-		return
-	}
-	if join.Type != "join" || join.Room == "" || join.PeerID == "" {
-		_ = conn.Close(websocket.StatusPolicyViolation, "first message must be join with room+peerId")
-		return
+	{
+		ctx, cancel := context.WithTimeout(connCtx, joinTimeout)
+		err = readJSONSkippingEmpty(ctx, conn, &join)
+		cancel()
+		if err != nil {
+			log.Printf("join read error: %v", err)
+			_ = conn.Close(websocket.StatusPolicyViolation, "first message must be join")
+			return
+		}
+		if join.Type != "join" || join.Room == "" || join.PeerID == "" {
+			_ = conn.Close(websocket.StatusPolicyViolation, "first message must be join with room+peerId")
+			return
+		}
 	}
 
 	room := hub.get(join.Room)
@@ -147,18 +173,20 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	room.add(client)
 	log.Printf("peer %s joined room %s", client.id, room.id)
 
-	// Уведомим остальных
+	// Уведомляем остальных в комнате
 	notify := Envelope{Type: "peer-joined", Room: room.id, PeerID: client.id}
-	notifyBytes, _ := json.Marshal(notify)
-	room.broadcast(client.id, notifyBytes)
+	if b, _ := json.Marshal(notify); b != nil {
+		room.broadcast(client.id, b)
+	}
 
-	// Запускаем writer goroutine
-	go writer(ctx, client)
+	// 2) Writer goroutine: серверные PING'и + отправка сообщений
+	go writer(connCtx, client)
 
-	// Reader loop
+	// 3) Reader loop
 	for {
 		var env Envelope
-		if err := readJSON(ctx, conn, &env); err != nil {
+		if err := readJSONSkippingEmpty(connCtx, conn, &env); err != nil {
+			// клиент закрылся или сеть/таймаут
 			if websocket.CloseStatus(err) != -1 {
 				log.Printf("peer %s read close: %v", client.id, err)
 			}
@@ -170,69 +198,99 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			out := Envelope{
 				Type: env.Type, Room: room.id, From: client.id, SDP: env.SDP,
 			}
-			b, _ := json.Marshal(out)
-			room.broadcast(client.id, b)
+			if b, _ := json.Marshal(out); b != nil {
+				room.broadcast(client.id, b)
+			}
 
 		case "ice":
 			out := Envelope{
 				Type: env.Type, Room: room.id, From: client.id, Candidate: env.Candidate,
 			}
-			b, _ := json.Marshal(out)
-			room.broadcast(client.id, b)
+			if b, _ := json.Marshal(out); b != nil {
+				room.broadcast(client.id, b)
+			}
 
 		case "leave":
-			// добровольный выход
 			log.Printf("peer %s leave", client.id)
 			goto EXIT
 
 		default:
-			// игнор
+			// игнорируем неизвестные типы
 		}
 	}
 
 EXIT:
-	// Очистка
+	// cleanup
 	room.remove(client.id)
 	hub.maybeDelete(room.id)
 	close(client.send)
-	// можно уведомить о выходе при необходимости:
-	// left := Envelope{Type: "peer-left", Room: room.id, PeerID: client.id}
-	// b, _ := json.Marshal(left)
-	// room.broadcast(client.id, b)
 }
 
+// writer: периодический PING + отправка накопленных сообщений
 func writer(ctx context.Context, c *Client) {
-	ping := time.NewTicker(20 * time.Second)
-	defer ping.Stop()
+	pingTicker := time.NewTicker(pingInterval)
+	defer pingTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+
 		case msg, ok := <-c.send:
 			if !ok {
 				return
 			}
-			ctxWrite, cancel := context.WithTimeout(ctx, 10*time.Second)
-			err := c.conn.Write(ctxWrite, websocket.MessageText, msg)
+			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+			err := c.conn.Write(wctx, websocket.MessageText, msg)
 			cancel()
 			if err != nil {
 				return
 			}
-		case <-ping.C:
-			_ = c.conn.Ping(ctx)
+
+		case <-pingTicker.C:
+			// Ping блокирует до получения PONG (или до таймаута контекста)
+			pctx, cancel := context.WithTimeout(ctx, pongTimeout)
+			err := c.conn.Ping(pctx)
+			cancel()
+			if err != nil {
+				// Нет PONG — разрываем
+				_ = c.conn.Close(websocket.StatusPolicyViolation, "pong timeout")
+				return
+			}
 		}
 	}
 }
 
-func readJSON(ctx context.Context, c *websocket.Conn, v any) error {
-	typ, data, err := c.Read(ctx)
-	if err != nil {
-		return err
+// readJSONSkippingEmpty читает следующее непустое текстовое/binary сообщение и парсит JSON.
+// Пустые и не текстовые — игнорирует.
+func readJSONSkippingEmpty(ctx context.Context, c *websocket.Conn, v any) error {
+	for {
+		typ, data, err := c.Read(ctx)
+		if err != nil {
+			return err
+		}
+		if len(data) == 0 {
+			// пустая строка — бывает от клиентов вроде wscat при лишнем Enter
+			continue
+		}
+		if typ != websocket.MessageText && typ != websocket.MessageBinary {
+			// не текст — игнор
+			continue
+		}
+		if err := json.Unmarshal(data, v); err != nil {
+			// логируем и продолжаем ждать валидный JSON (не рвём соединение)
+			log.Printf("bad json: %v, raw=%q", err, truncateForLog(data, 256))
+			continue
+		}
+		return nil
 	}
-	if typ != websocket.MessageText && typ != websocket.MessageBinary {
-		return errors.New("unexpected ws message type")
+}
+
+func truncateForLog(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
 	}
-	return json.Unmarshal(data, v)
+	return fmt.Sprintf("%s...(+%d bytes)", string(b[:n]), len(b)-n)
 }
 
 func healthz(w http.ResponseWriter, _ *http.Request) {
@@ -253,7 +311,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	// graceful shutdown
+	// http server
 	go func() {
 		log.Printf("signaling server listening on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -261,6 +319,7 @@ func main() {
 		}
 	}()
 
+	// graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop

@@ -26,9 +26,9 @@ type Candidate struct {
 
 // Envelope - это обертка для всех сообщений WebSocket.
 type Envelope struct {
-	Type      string     `json:"type"`                // offer | answer | ice | peer-joined | error
+	Type      string     `json:"type"`                // offer | answer | ice | peer-joined | peer-left | error
 	Room      string     `json:"room,omitempty"`      // Сервер подставляет ID комнаты
-	PeerID    string     `json:"peerId,omitempty"`    // Для 'peer-joined'
+	PeerID    string     `json:"peerId,omitempty"`    // Для 'peer-joined', 'peer-left'
 	From      string     `json:"from,omitempty"`      // Сервер подставляет ID отправителя
 	SDP       string     `json:"sdp,omitempty"`       // Для 'offer' и 'answer'
 	Candidate *Candidate `json:"candidate,omitempty"` // Для 'ice'
@@ -43,6 +43,7 @@ type Client struct {
 	room *Room
 	conn *websocket.Conn
 	send chan []byte // Буферизированный канал для исходящих сообщений
+	ctx  context.Context
 }
 
 // Room управляет набором клиентов в одной комнате.
@@ -75,11 +76,16 @@ func (r *Room) broadcast(from string, payload []byte) {
 		if id == from {
 			continue // Не отправляем сообщение самому себе
 		}
+
+		// Проверяем, не закрылся ли контекст клиента, перед отправкой
+		if c.ctx.Err() != nil {
+			continue
+		}
+
 		select {
 		case c.send <- payload:
 		default:
 			// Если канал переполнен, значит клиент "тормозит".
-			// Закрываем его соединение в отдельной горутине.
 			log.Printf("Slow consumer detected for client %s. Closing connection.", c.id)
 			go c.conn.Close(websocket.StatusPolicyViolation, "slow consumer")
 		}
@@ -102,7 +108,7 @@ func (h *Hub) getOrCreate(roomID string) *Room {
 	if !ok {
 		r = &Room{id: roomID, clients: make(map[string]*Client)}
 		h.rooms[roomID] = r
-		log.Printf("Room %s created", roomID)
+		log.Printf("Room '%s' created", roomID)
 	}
 	return r
 }
@@ -120,7 +126,7 @@ func (h *Hub) maybeDelete(room *Room) {
 
 	if isEmpty {
 		delete(h.rooms, room.id)
-		log.Printf("Room %s deleted as it is empty", room.id)
+		log.Printf("Room '%s' deleted as it is empty", room.id)
 	}
 }
 
@@ -135,69 +141,92 @@ const (
 )
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-	// --- ИСПРАВЛЕНИЕ 1: Получаем параметры из URL, а не ждем 'join' ---
 	roomID := r.URL.Query().Get("room")
 	peerID := r.URL.Query().Get("peer")
 
 	if roomID == "" || peerID == "" {
-		http.Error(w, "Missing 'room' or 'peer' query parameter", http.StatusBadRequest)
+		http.Error(w, "Query parameters 'room' and 'peer' are required", http.StatusBadRequest)
 		return
 	}
 
-	// Обновляем соединение до WebSocket
+	// --- ГЛАВНОЕ ИСПРАВЛЕНИЕ: Конфигурация для локальной отладки ---
+	// Для Android-эмулятора, который не отправляет заголовок Origin, нам нужно
+	// отключить проверку. Для браузеров оставляем проверку.
+	// Для локальной отладки с эмулятором запускайте сервер так: `WS_DEV_MODE=1 go run .`
+	isDevMode := getenv("WS_DEV_MODE", "") != ""
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// Разрешаем только доверенные источники (Origin).
-		// Для разработки можно установить переменную окружения WS_DEV_MODE=1
-		InsecureSkipVerify: getenv("WS_DEV_MODE", "") != "",
-		OriginPatterns:     []string{"webrtc.mediarise.org"},
+		// В режиме разработки отключаем проверку Origin. Это РАЗРЕШИТ
+		// подключение с Android-эмулятора, который не шлет этот заголовок.
+		InsecureSkipVerify: isDevMode,
+		// В продакшене (когда WS_DEV_MODE не установлен) будут работать только эти домены.
+		OriginPatterns: []string{"jopa-call.com", "webrtc.mediarise.org"},
 	})
 	if err != nil {
-		log.Printf("WebSocket upgrade failed: %v", err)
-		// http.Error уже отправлен функцией Accept
+		log.Printf("WebSocket upgrade failed for peer %s: %v", peerID, err)
 		return
 	}
-	// Гарантируем закрытие соединения при выходе из функции.
 	defer conn.Close(websocket.StatusNormalClosure, "handler finished")
 	conn.SetReadLimit(readLimitBytes)
 
-	// Создаем клиента и добавляем его в комнату
+	// Контекст для этого конкретного соединения
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
 	room := hub.getOrCreate(roomID)
 	client := &Client{
 		id:   peerID,
 		room: room,
 		conn: conn,
-		send: make(chan []byte, 256), // Увеличенный буфер для защиты от кратковременных всплесков
+		send: make(chan []byte, 256),
+		ctx:  ctx,
 	}
 	room.add(client)
-	log.Printf("Client %s connected to room %s", client.id, room.id)
+	log.Printf("Client '%s' connected to room '%s'", client.id, room.id)
+
+	// При выходе из функции (включая панику), убираем клиента из комнаты.
+	defer func() {
+		room.remove(client.id)
+		hub.maybeDelete(room)
+		// Оповещаем остальных, что клиент ушел
+		leavePayload, _ := json.Marshal(&Envelope{Type: "peer-left", PeerID: client.id})
+		room.broadcast(client.id, leavePayload)
+		log.Printf("Cleanup for client '%s' finished", client.id)
+	}()
+
+	// Оповещаем нового клиента обо всех, кто уже есть в комнате
+	existingPeers := make([]string, 0, len(room.clients))
+	room.mu.RLock()
+	for id := range room.clients {
+		if id != client.id {
+			existingPeers = append(existingPeers, id)
+		}
+	}
+	room.mu.RUnlock()
+
+	for _, peer := range existingPeers {
+		payload, _ := json.Marshal(&Envelope{Type: "peer-joined", PeerID: peer})
+		client.send <- payload
+	}
 
 	// Оповещаем остальных участников о новом клиенте
 	notifyPayload, _ := json.Marshal(&Envelope{Type: "peer-joined", PeerID: client.id})
 	room.broadcast(client.id, notifyPayload)
 
 	// Запускаем горутину для записи сообщений этому клиенту
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	go writer(ctx, client)
+	go writer(client)
 
-	// При выходе из функции (включая панику), убираем клиента из комнаты.
-	defer func() {
-		room.remove(client.id)
-		hub.maybeDelete(room)
-		leavePayload, _ := json.Marshal(&Envelope{Type: "peer-left", PeerID: client.id}) // Оповещаем, что клиент ушел
-		room.broadcast(client.id, leavePayload)
-	}()
-
-	// --- ИСПРАВЛЕНИЕ 2: Упрощенный цикл чтения ---
-	// Теперь мы не ждем 'join', а сразу начинаем обрабатывать сообщения.
+	// Основной цикл чтения сообщений от клиента
 	for {
 		msgType, data, err := conn.Read(ctx)
 		if err != nil {
-			if websocket.CloseStatus(err) != -1 {
-				log.Printf("Read error from %s: %v", client.id, err)
+			if errors.Is(err, context.Canceled) {
+				log.Printf("Client %s context cancelled.", client.id)
+			} else if websocket.CloseStatus(err) != -1 {
+				log.Printf("Connection closed by client %s: %v", client.id, err)
+			} else {
+				log.Printf("Read error from client %s: %v", client.id, err)
 			}
-			// Ошибка чтения означает, что клиент отсоединился. Выходим из цикла.
-			break
+			break // Выходим из цикла при любой ошибке чтения
 		}
 
 		if msgType != websocket.MessageText {
@@ -207,14 +236,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		var envelope Envelope
 		if err := json.Unmarshal(data, &envelope); err != nil {
 			log.Printf("Invalid JSON from %s: %v", client.id, err)
-			continue // Игнорируем невалидный JSON
+			continue
 		}
 
-		// --- ИСПРАВЛЕНИЕ 3: Сервер сам подставляет `from` и `room` ---
 		envelope.From = client.id
 		envelope.Room = room.id
+		log.Printf("Received '%s' from '%s', broadcasting to room '%s'", envelope.Type, client.id, room.id)
 
-		// Ре-маршаллинг для рассылки другим клиентам
 		payload, err := json.Marshal(envelope)
 		if err != nil {
 			log.Printf("JSON marshal error: %v", err)
@@ -225,37 +253,37 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		case "offer", "answer", "ice":
 			room.broadcast(client.id, payload)
 		default:
-			log.Printf("Unknown message type '%s' from client %s", envelope.Type, client.id)
+			log.Printf("Unknown message type '%s' from client '%s'", envelope.Type, client.id)
 		}
 	}
 }
 
 // writer обрабатывает отправку сообщений и пинги.
-func writer(ctx context.Context, c *Client) {
+func writer(c *Client) {
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
 
 	for {
 		select {
-		case <-ctx.Done(): // Контекст соединения был отменен
+		case <-c.ctx.Done():
 			return
 		case msg, ok := <-c.send:
-			if !ok { // Канал `send` был закрыт
-				c.conn.Close(websocket.StatusNormalClosure, "channel closed")
+			if !ok {
+				c.conn.Close(websocket.StatusNormalClosure, "send channel closed")
 				return
 			}
-
-			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+			wctx, cancel := context.WithTimeout(c.ctx, writeTimeout)
 			err := c.conn.Write(wctx, websocket.MessageText, msg)
 			cancel()
 			if err != nil {
 				log.Printf("Write error to %s: %v", c.id, err)
-				return // Завершаем горутину при ошибке записи
+				return
 			}
 		case <-pingTicker.C:
-			// Используем Ping, который сам ждет Pong.
-			// Если Pong не придет, вернется ошибка и мы выйдем из горутины.
-			if err := c.conn.Ping(ctx); err != nil {
+			pctx, cancel := context.WithTimeout(c.ctx, writeTimeout)
+			err := c.conn.Ping(pctx)
+			cancel()
+			if err != nil {
 				log.Printf("Ping failed for %s: %v", c.id, err)
 				return
 			}
@@ -280,17 +308,15 @@ func main() {
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second, // Добавлено для лучшего управления ресурсами
+		IdleTimeout:       120 * time.Second,
 	}
 
-	// Запуск сервера в горутине, чтобы не блокировать main.
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("HTTP server ListenAndServe error: %v", err)
 		}
 	}()
 
-	// Настройка Graceful Shutdown.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop

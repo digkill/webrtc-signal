@@ -1,0 +1,43 @@
+[Unit]
+Description=WebRTC Signaling Server
+# Запускаться только после того, как сеть будет полностью готова
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# --- Основные исправления ---
+# 1. Загружаем переменные из .env файла
+EnvironmentFile=/opt/webrtc-signal/.env
+
+# 2. Команда запуска теперь не содержит конфигурации.
+#    Все параметры (ADDR, ALLOWED_ORIGIN, WS_DEV_MODE) берутся из переменных окружения,
+#    загруженных из файла выше.
+ExecStart=/opt/webrtc-signal/webrtc-signal
+
+# --- Улучшения и настройки безопасности ---
+User=webrtc
+Group=webrtc
+WorkingDirectory=/opt/webrtc-signal
+
+# Политика перезапуска
+Restart=always
+RestartSec=3
+
+# Настройки безопасности (песочница)
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# Убираем доступ к ненужным частям системы
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# Явно запрещаем любые системные вызовы, связанные с изменением времени
+RestrictSystemCalls=~@clock
+
+# Увеличение лимита открытых файлов для обработки множества WebSocket соединений
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+
